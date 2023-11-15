@@ -1,0 +1,374 @@
+---
+title: "transmit uplink diags"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+# notes
+
+# setup instructions
+edit `data_search_path` to where you're wildlife computers portal downloaded data is and run this. 
+
+the r code below expects `\*-Status.csv`, `\*-All.csv`, `*-Corrupt.csv` files and does its best to recover from errors and missing data. it should be robust to several different file storage solutions, searches recursively in the data directory for all status and all files and should ignore all other files in the path.
+
+if you have a metadata csv file with columns for `ptt` and `deploydate_yyyymmdd` you can set `metadata_path` to the csv and set `deploytime_metadata` to `TRUE`. this will cut off any undeleted data on the tag prior to deployment which sometimes makes the graphs messy and hard to read and impacts tx rate estimates etc.
+
+```{r setup-change-this-path, echo = FALSE}
+# change this path to your tag archives
+data_search_path <- ""
+
+# set deploytime_metadata to TRUE and set your path to your metadata csv
+# if you want to cut off predeployment data
+# metadata_path must point to a csv
+# must have columns ptt and deploydate_yyyymmdd (and expects a date in that format)
+deploytime_metadata <- FALSE
+metadata_path <- ".csv"
+
+```
+
+```{r setup, echo = FALSE}
+# helper functions
+dateseq <- function(d, hours = FALSE) {
+  unit <- 60 * 60 * 24
+  if (hours) 
+    unit <- 60 * 60
+  mind <- min(d, na.rm = TRUE)
+  maxd <- max(d, na.rm = TRUE)
+  std <- ceiling(mind/unit) * unit
+  end <- ceiling(maxd/unit) * unit
+  seq(std, end, by = unit)
+}
+
+matchtimes <- function(t1, t2) {
+  # t1, t2 are numeric
+  findInterval(t1, c(-Inf, head(t2, -1)) + c(0, diff(t2)/2))
+}
+```
+
+# plots
+```{r load-and-calc, echo = FALSE}
+# load metadata if required
+if(deploytime_metadata) {
+  # load metadata and make a deploytimes cutoff
+  deploymeta <- read.table(metadata_path, header = TRUE, sep = ',', stringsAsFactors = FALSE)
+  # make a data cutoff for each tag to remove extraneous data
+  deploytimes <- as.POSIXct(
+	  as.character(deploymeta$deploydate_yyyymmdd),
+	  format = "%Y%m%d",
+	  tz = "UTC"
+)
+
+# make datenum
+deploytimes <- as.numeric(deploytimes)
+}
+
+# look for status and all data files
+fpaths <- list.files(data_search_path, recursive = TRUE)
+dese <- grepl("*-Status.csv$|*-All.csv$|*-Corrupt.csv$", fpaths)
+
+# if there is nothing then throw an error
+if(all(!dese)) stop(paste("I can't find any data in", data_search_path))
+
+# pair down the files to just these
+fpaths <- fpaths[dese]
+fnames <- basename(fpaths)
+
+# grab the ptt or whatever is the prefix so can match sta and all
+ptts <- sub("-Status.csv|-All.csv|-Corrupt.csv", "", fnames)
+uptts <- unique(ptts)
+nptts <- length(uptts)
+
+# set up a list to hold kable data
+kables <- list()
+kables_uplinks_per_day <- list()
+kables_corrupt <- list()
+
+# iterate through and check the transmits
+for(i in 1:nptts) {
+  curptt <- uptts[i]
+  dese <- fpaths[ptts == curptt]
+  
+  # should never trip this
+  if(length(dese) == 0) stop(paste("something has gone horribly wrong at index",i, "prefix", curptt))
+  
+  # find the paths for status and all
+  sta_fpath <- dese[grepl("-Status.csv$", dese)]
+  all_fpath <- dese[grepl("-All.csv$", dese)]
+  cor_fpath <- dese[grepl("-Corrupt.csv$", dese)]
+  
+  # throw a warning if there isn't an all
+  # this is weird there should always be an all
+  # otherwise load the file and grab the uplinks
+  curall <- NULL
+  if(length(all_fpath) == 0) {
+    warning(paste("there is no all for", curptt, "but also weird shoudn't happen ever...?"))
+  } else {
+    # load file
+      tryCatch({
+    curall <- read.table(file.path(data_search_path, all_fpath), header = TRUE, sep = ',', stringsAsFactors = FALSE)
+      }, 
+        error = function(e) {
+          warning(e)  
+        },
+        warnings = function(e) {
+          warning(e)
+        },
+      finally = {})
+  }
+  
+    # do a little bit if we have a file
+    if(!is.null(curall)) {
+      # make a bunch of different dates
+      curall$date_posix <- as.POSIXct(curall$Msg.Date, format = "%m/%d/%Y %H:%M:%S", tz = 'utc')
+      curall$datenum <- as.numeric(curall$date_posix)
+      curall$day <- format(curall$date_posix, "%Y%m%d")
+      
+      # sort by date just in case sometimes the order gets messed up
+      curall <- curall[order(curall$datenum), ]
+      
+      # cutoff
+      if(deploytime_metadata) {
+        curall <- curall[curall$datenum >= deploytimes[deploymeta$ptt == curall$Platform.ID.No.[1]], ]
+      }
+      
+      # uplinks per day
+      uplinks_per_day <- as.data.frame(table(curall$day))
+      names(uplinks_per_day) <- c(paste(curall$DeployID[1], curptt), 'count')
+      kables_uplinks_per_day[[i]] <- uplinks_per_day
+      
+      # cumulative unlinks plot
+      plot(curall$datenum, 1:nrow(curall), xaxt = 'n', main = paste(curall$DeployID[1], curall$Platform.ID.No[1], sep = ' / '), xlab = "", ylab = "rx", las = 1)
+      lines(curall$datenum, 1:nrow(curall))
+      
+      # human readible axis
+      ax <- dateseq(curall$datenum)
+      axis(1, at = ax, lab = as.POSIXct(ax, tz = 'utc', origin = "1970-01-01"), las = 2)
+    }
+
+  cursta <- NULL
+  if(length(sta_fpath) == 0) { 
+    warning(paste("there is no status for", curptt))
+  } else {
+    # load file
+        tryCatch({
+      cursta <- read.table(file.path(data_search_path, sta_fpath), header = TRUE, sep = ',', stringsAsFactors = FALSE)
+        }, 
+        error = function(e) {
+          warning(e)  
+        },
+        warnings = function(e) {
+          warning(e)
+        },
+      finally = {})
+  }
+  
+  # if we have a file do a little bit
+  if(!is.null(cursta)) {
+    # make a real dates
+    cursta$date_posix <- as.POSIXct(cursta$Received, format = "%H:%M:%S %d-%b-%Y", tz = "UTC")
+    cursta$datenum <- as.numeric(cursta$date_posix)
+    
+    # sort just in case
+    cursta <- cursta[order(cursta$datenum), ]
+    
+    # cutoff
+    if(deploytime_metadata) {
+      cursta <- cursta[cursta$datenum >= deploytimes[deploymeta$ptt == cursta$Ptt[1]], ]
+    }
+    
+    # filter out non crc messages as they tend to be mad corrupt
+    # make sure there aren't NAs because that'll mess up the filter
+    cursta$Type[is.na(cursta$Type)] <- ""
+    cursta <- cursta[cursta$Type == 'CRC', ]
+  
+  if(nrow(cursta) > 0 ) {
+   cursta2 <- cursta[!is.na(cursta$Transmits), ]  
+   cursta2$difftime <- c(NA, diff(cursta2$datenum))/60/60/24 # in days
+   cursta2$difftransmits <- c(NA, diff(cursta2$Transmits))
+   cursta2$transmits_per_day <- cursta2$difftransmits / cursta2$difftime
+   
+   # cumulative transmits plot
+   plot(cursta$datenum, cursta$Transmits, xaxt = 'n', main = paste(cursta$DeployID[1], cursta$Ptt[1], sep = ' / '), xlab = "", ylab = "tx", las = 1)
+   lines(cursta$datenum[!is.na(cursta$Transmits)], cursta$Transmits[!is.na(cursta$Transmits)])
+   
+   # human readible axis
+   ax <- dateseq(curall$datenum)
+   axis(1, at = ax, lab = as.POSIXct(ax, tz = 'utc', origin = "1970-01-01"), las = 2)
+   
+   # plot on transmits per day
+   # make a midpoint
+   xx <- c(NA, rowSums(cbind(cursta2$datenum[2:nrow(cursta)], cursta2$datenum[1:(nrow(cursta) - 1)]))/2)
+   yy <- c(NA, rowSums(cbind(cursta2$Transmits[2:nrow(cursta)], cursta2$Transmits[1:(nrow(cursta) - 1)]))/2)
+   text(xx, yy, paste(round(cursta2$transmits_per_day), 'tx/day'))
+   
+  } else {
+    cursta <- NULL
+    warning(paste("no CRC'd status messages for", curptt))
+  }
+}
+  
+  if(!is.null(curall) & !is.null(cursta)) {
+    # plot uplinks against transmits perday
+    if(nrow(cursta2) > 1) {
+    cursta2$nuplinks <- NA
+    
+    # merge in number of uplinks for same time period
+    for(p in 2:nrow(cursta2)) {
+      st <- cursta2$datenum[p - 1]
+      en <- cursta2$datenum[p]
+      
+      dese <- curall$datenum >= st & curall$datenum <= en
+      cursta2$nuplinks[p] <- length(which(dese))
+    }
+    
+    cursta2$uplinks_per_day <- cursta2$nuplinks / cursta2$difftime
+    cursta2$uplink_transmits_ratio <- cursta2$uplinks_per_day / cursta2$transmits_per_day
+    
+    # save a table
+    kables[[i]] <- cursta2[, c('DeployID', 'Ptt', 'date_posix', 'datenum', 'difftime', 'Transmits', 'difftransmits', 'transmits_per_day', 'nuplinks', 'uplinks_per_day', 'uplink_transmits_ratio')]
+    }
+  }
+  
+  # load the corrupt file if it is there
+  curcor <- NULL
+  if(length(cor_fpath) == 0) { 
+    warning(paste("there is no corrupt for", curptt))
+  } else {
+    # load file
+        tryCatch({
+      curcor <- read.table(file.path(data_search_path, cor_fpath), header = TRUE, sep = ',', stringsAsFactors = FALSE)
+        }, 
+        error = function(e) {
+          warning(e)  
+        },
+        warnings = function(e) {
+          warning(e)
+        },
+      finally = {})
+  }
+  
+  # if we have a file do a little bit
+  if(!is.null(curcor)) {
+    # make a real dates
+    curcor$date_posix <- as.POSIXct(curcor$Date, format = "%H:%M:%S %d-%b-%Y", tz = "UTC")
+    curcor$datenum <- as.numeric(curcor$date_posix)
+    
+    # sort just in case
+    curcor <- curcor[order(curcor$datenum), ]
+    
+    # cutoff
+    if(deploytime_metadata) {
+      curcor <- curcor[curcor$datenum >= deploytimes[deploymeta$ptt == curcor$Ptt[1]], ]
+    }
+    
+    # count
+    yy <- 1:nrow(curcor)
+    curcor$yy <- yy
+    
+    plot(curcor$datenum, yy, xaxt = 'n', main = paste(curcor$DeployID[1], curcor$Ptt[1], sep = ' / '), xlab = "", ylab = "no. corrupt", las = 1)
+    lines(curcor$datenum, yy)
+    ax <- dateseq(curcor$datenum)
+    axis(1, at = ax, lab = as.POSIXct(ax, tz = 'utc', origin = "1970-01-01"), las = 2)
+  }
+  
+  kables_corrupt[[i]] <- curcor
+}
+```
+
+# all corrupt
+```{r plot-all-corrupt, echo = FALSE}
+xx <- lapply(kables_corrupt, function(x) (x$datenum - min(x$datenum)) / 60 / 60 ) # hours
+yy <- lapply(kables_corrupt, '[[', 'yy')
+
+plot(do.call(c, xx), do.call(c, yy), type = 'n', xlab = "running hours", ylab = "no. corrupt")
+
+for(i in 1:length(kables_corrupt)) {
+  lines(xx[[i]], yy[[i]], col = i)
+}
+
+plot(0, 0, type ='n', xlab = '', ylab = '', axes = FALSE)
+legend("center",  col = 1:length(kables_corrupt), lty = 1, legend = sapply(kables_corrupt, function(x) paste(x$DeployID[1], x$Ptt[1])), border = FALSE)
+```
+
+# histos: rx per day, tx per day, rx/tx ratio
+purple broken line = mean
+annotation = mean (sd)
+```{r hists-uplinks-per-day, echo = FALSE, results = 'asis'}
+for(i in 1:length(kables_uplinks_per_day)) {
+  titlelab <- names(kables_uplinks_per_day[[i]])[1]
+  
+  par(mfrow = c(2, 2))
+  
+  if(!is.null(kables_uplinks_per_day[[i]])) {
+    hist(kables_uplinks_per_day[[i]]$count, main = titlelab, xlab = 'rx/day')
+    
+    uppdbar <- mean(kables_uplinks_per_day[[i]]$count, na.rm = TRUE)
+    uppdsd <- sd(kables_uplinks_per_day[[i]]$count, na.rm = TRUE)
+    
+    abline(v = uppdbar, col = "purple", lty = 2)
+    text(uppdbar, .75, paste0(round(uppdbar, 1), " (", round(uppdsd, 2), ")"), col = "purple")
+  } else {
+    plot(0, 0, type = 'n', axes = FALSE, xlab = '', ylab = '')
+    text(0, 0, "rx/day: na")
+  }
+  
+  if(!is.null(kables[[i]])) {
+    txpd <- kables[[i]]$transmits_per_day[which(kables[[i]]$difftime > 0.5 & kables[[i]]$difftime < 5)]
+    
+    if(length(txpd) > 0) {
+      txpdbar <- mean(txpd, na.rm = TRUE)
+      txpdsd <- sd(txpd, na.rm = TRUE)
+    
+      hist(txpd, main = '', xlab = 'tx/day')
+      abline(v = txpdbar, col = "purple", lty = 2)
+      text(txpdbar, .75, paste0(round(txpdbar), " (", round(txpdsd), ")"), col = "purple")
+    } else {
+      plot(0, 0, type = 'n', axes = FALSE, xlab = '', ylab = '')
+      text(0, 0, "tx/day: na")
+    }
+  } else {
+    plot(0, 0, type = 'n', axes = FALSE, xlab = '', ylab = '')
+    text(0, 0, "tx/day: na")
+  }
+  
+  if(!is.null(kables[[i]])) {
+    upptx <- kables[[i]]$uplink_transmits_ratio[which(kables[[i]]$difftime > 0.5 & kables[[i]]$difftime < 5)]
+    
+    if(length(upptx) > 0) {
+      upptxbar <- mean(upptx, na.rm = TRUE)
+      upptxsd <- sd(upptx, na.rm = TRUE)
+    
+      hist(upptx, main = '', xlab = 'rx/tx')
+      abline(v = upptxbar, col = "purple", lty = 2)
+      text(upptxbar, .75, paste0(round(upptxbar, 2), " (", round(upptxsd, 2), ")"), col = "purple")
+    } else {
+      plot(0, 0, type = 'n', axes = FALSE, xlab = '', ylab = '')
+      text(0, 0, "rx/tx: na")
+    }
+  } else {
+    plot(0, 0, type = 'n', axes = FALSE, xlab = '', ylab = '')
+    text(0, 0, "rx/tx: na")
+  }
+}
+```
+
+# tables: rx/day
+```{r print-uplinks-per-day, echo = FALSE, results = 'asis'}
+for(i in 1:length(kables_uplinks_per_day)) {
+  print(knitr::kable(kables_uplinks_per_day[[i]]))
+  cat("\n")
+}
+```
+
+# tables: rx/tx
+```{r print-ratio, echo = FALSE, results = 'asis'}
+for(i in 1:length(kables)) {
+  print(knitr::kable(kables[[i]]))
+  cat("\n")
+}
+```
+
